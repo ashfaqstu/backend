@@ -156,7 +156,8 @@ CORS_ALLOWED_ORIGINS = [
 # Add Render frontend URL
 FRONTEND_URL = os.environ.get('FRONTEND_URL')
 if FRONTEND_URL:
-    CORS_ALLOWED_ORIGINS.append(FRONTEND_URL)
+    # Remove trailing slash to avoid CORS error
+    CORS_ALLOWED_ORIGINS.append(FRONTEND_URL.rstrip('/'))
 
 CORS_ALLOW_CREDENTIALS = True
 
