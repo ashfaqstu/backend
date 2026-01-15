@@ -29,7 +29,7 @@ from .extraction import (
     extract_text_from_pdf,
     extract_approved_terms,
     extract_executed_terms,
-    validate_terms
+    validate_terms_comparison as validate_terms
 )
 
 

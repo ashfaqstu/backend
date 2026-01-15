@@ -1,20 +1,38 @@
 """
-Document extraction service for DocConform.
-Extracts terms from executed agreements and approved credit summaries.
+Document extraction orchestrator for DocConform.
+Coordinates text extraction, term extraction, and validation.
+
+This module serves as the main entry point for document processing.
+All extraction is evidence-based - no hallucinated data allowed.
 """
-import re
-import hashlib
-from typing import Optional, Dict, List, Any
+
+import logging
+from typing import List, Dict, Any, Optional, BinaryIO
 from dataclasses import dataclass
 
-try:
-    import pdfplumber
-except ImportError:
-    pdfplumber = None
+from .services.text_extractor import (
+    extract_text_with_pages,
+    compute_sha256,
+    PageText,
+)
+from .services.term_extractor import (
+    extract_terms_from_text,
+    TermExtractionResult,
+    SourceType,
+)
+from .services.validation import (
+    validate_terms,
+    check_internal_consistency,
+    ValidationIssue,
+)
+from .services.normalizer import normalize_term_value
+
+logger = logging.getLogger(__name__)
 
 
 @dataclass
 class ExtractedTermData:
+    """Legacy compatibility class for term data."""
     key: str
     label: str
     value: str
@@ -22,409 +40,277 @@ class ExtractedTermData:
     confidence: float
     evidence_text: str
     evidence_location: str
-
-
-def compute_file_hash(file_obj) -> str:
-    """Compute SHA-256 hash of a file."""
-    sha256_hash = hashlib.sha256()
-    file_obj.seek(0)
-    for chunk in iter(lambda: file_obj.read(4096), b""):
-        sha256_hash.update(chunk)
-    file_obj.seek(0)
-    return sha256_hash.hexdigest()
-
-
-def extract_text_from_pdf(file_obj) -> str:
-    """Extract text from a PDF file using pdfplumber."""
-    if pdfplumber is None:
-        raise ImportError("pdfplumber is required for PDF extraction")
+    page: int = 1
+    normalized: bool = False
+    raw_value: str = ""
     
-    file_obj.seek(0)
-    text = ""
-    try:
-        with pdfplumber.open(file_obj) as pdf:
-            for page in pdf.pages:
-                page_text = page.extract_text()
-                if page_text:
-                    text += page_text + "\n"
-    except Exception as e:
-        raise ValueError(f"Failed to extract text from PDF: {e}")
+    def to_dict(self) -> dict:
+        return {
+            'key': self.key,
+            'label': self.label,
+            'value': self.value,
+            'source': self.source,
+            'confidence': self.confidence,
+            'evidence_text': self.evidence_text,
+            'evidence_location': self.evidence_location,
+            'page': self.page,
+        }
+
+
+def compute_file_hash(file_obj: BinaryIO) -> str:
+    """
+    Compute SHA-256 hash of a file for integrity verification.
+    Wrapper for the service function.
+    """
+    return compute_sha256(file_obj)
+
+
+def extract_text_from_pdf(file_obj: BinaryIO) -> str:
+    """
+    Extract all text from a PDF file.
+    Returns combined text from all pages.
+    """
+    pages = extract_text_with_pages(file_obj)
+    return "\n\n".join(p.text for p in pages if p.text)
+
+
+def _convert_pages_to_dict(pages: List[PageText]) -> List[Dict[str, Any]]:
+    """Convert PageText objects to dictionaries for term extraction."""
+    return [
+        {
+            'page': p.page_number,
+            'text': p.text,
+        }
+        for p in pages
+    ]
+
+
+def _convert_extraction_result(result: TermExtractionResult, apply_normalization: bool = True) -> ExtractedTermData:
+    """Convert TermExtractionResult to ExtractedTermData with optional normalization."""
+    value = result.value
+    normalized = False
+    raw_value = result.value
     
-    return text
+    if apply_normalization:
+        normalized_value = normalize_term_value(result.key, result.value)
+        if normalized_value != result.value:
+            value = normalized_value
+            normalized = True
+    
+    return ExtractedTermData(
+        key=result.key,
+        label=result.label,
+        value=value,
+        source=result.source,
+        confidence=result.confidence,
+        evidence_text=result.evidence_text,
+        evidence_location=result.evidence_location,
+        page=result.page,
+        normalized=normalized,
+        raw_value=raw_value,
+    )
 
 
-def extract_approved_terms(file_obj, filename: str) -> List[ExtractedTermData]:
+def extract_approved_terms(file_obj: BinaryIO, filename: str) -> List[ExtractedTermData]:
     """
     Extract terms from the Approved Credit Summary.
-    For the Boeing demo, these are the authoritative approved values.
-    """
-    terms = []
     
-    # Try to extract text from PDF
+    REGULATORY REQUIREMENT:
+    - All terms must have evidence from the document
+    - No hallucination allowed
+    
+    Args:
+        file_obj: File-like object containing the PDF
+        filename: Original filename (for logging)
+        
+    Returns:
+        List of extracted terms with evidence
+    """
+    logger.info(f"Extracting approved terms from: {filename}")
+    
     try:
-        text = extract_text_from_pdf(file_obj)
-    except Exception:
-        text = ""
-    
-    # Approved terms for Boeing demo (authoritative values)
-    # These represent what was approved by the credit committee
-    approved_terms_data = [
-        {
-            'key': 'borrower',
-            'label': 'Borrower',
-            'value': 'The Boeing Company',
-            'evidence_text': 'Borrower: The Boeing Company, a Delaware corporation',
-            'evidence_location': 'Page 1, Section: Parties',
-            'confidence': 1.00
-        },
-        {
-            'key': 'facility_type',
-            'label': 'Facility Type',
-            'value': '364-Day Revolving Credit Facility',
-            'evidence_text': 'Facility Type: 364-Day Revolving Credit Facility',
-            'evidence_location': 'Page 1, Section: Facility Terms',
-            'confidence': 1.00
-        },
-        {
-            'key': 'facility_amount',
-            'label': 'Facility Amount',
-            'value': 'USD 300,000,000',
-            'evidence_text': 'Approved Commitment Amount: USD 300,000,000 (Three Hundred Million Dollars)',
-            'evidence_location': 'Page 1, Section: Facility Terms',
-            'confidence': 1.00
-        },
-        {
-            'key': 'currency',
-            'label': 'Currency',
-            'value': 'USD',
-            'evidence_text': 'Currency: United States Dollars (USD)',
-            'evidence_location': 'Page 1, Section: Facility Terms',
-            'confidence': 1.00
-        },
-        {
-            'key': 'maturity_date',
-            'label': 'Maturity Date',
-            'value': '2026-08-25',
-            'evidence_text': 'Termination Date: August 25, 2026 (364 days from Closing)',
-            'evidence_location': 'Page 1, Section: Facility Terms',
-            'confidence': 1.00
-        },
-        {
-            'key': 'benchmark',
-            'label': 'Interest Rate Benchmark',
-            'value': 'SOFR',
-            'evidence_text': 'Benchmark Rate: Term SOFR (Secured Overnight Financing Rate)',
-            'evidence_location': 'Page 2, Section: Pricing',
-            'confidence': 1.00
-        },
-        {
-            'key': 'margin_bps',
-            'label': 'Applicable Margin',
-            'value': '125 bps',
-            'evidence_text': 'Applicable Margin: 125 basis points (1.25%) over SOFR',
-            'evidence_location': 'Page 2, Section: Pricing',
-            'confidence': 1.00
-        },
-        {
-            'key': 'covenant_total_net_leverage',
-            'label': 'Total Net Leverage Covenant',
-            'value': '3.50x',
-            'evidence_text': 'Maximum Total Net Leverage Ratio: 3.50 to 1.00',
-            'evidence_location': 'Page 2, Section: Financial Covenants',
-            'confidence': 1.00
-        },
-        {
-            'key': 'covenant_frequency',
-            'label': 'Covenant Testing Frequency',
-            'value': 'Quarterly',
-            'evidence_text': 'Testing Frequency: Quarterly, based on trailing four fiscal quarters',
-            'evidence_location': 'Page 2, Section: Financial Covenants',
-            'confidence': 1.00
-        },
-        {
-            'key': 'sanctions_clause_required',
-            'label': 'Sanctions Clause Required',
-            'value': 'Yes',
-            'evidence_text': 'Required Provisions: Sanctions compliance clause per bank policy',
-            'evidence_location': 'Page 3, Section: Required Provisions',
-            'confidence': 1.00
-        },
-        {
-            'key': 'bail_in_clause_required',
-            'label': 'Bail-In Clause Required',
-            'value': 'Yes',
-            'evidence_text': 'Required Provisions: EU/EEA Bail-In recognition clause per BRRD',
-            'evidence_location': 'Page 3, Section: Required Provisions',
-            'confidence': 1.00
-        },
-    ]
-    
-    for term_data in approved_terms_data:
-        terms.append(ExtractedTermData(
-            key=term_data['key'],
-            label=term_data['label'],
-            value=term_data['value'],
-            source='APPROVED',
-            confidence=term_data['confidence'],
-            evidence_text=term_data['evidence_text'],
-            evidence_location=term_data['evidence_location']
-        ))
-    
-    return terms
+        # Extract text with page tracking
+        pages = extract_text_with_pages(file_obj)
+        pages_dict = _convert_pages_to_dict(pages)
+        
+        # Check if we got any text
+        total_text = sum(len(p.text) for p in pages)
+        if total_text < 100:
+            logger.warning(f"Very little text extracted from {filename} ({total_text} chars)")
+        
+        # Extract terms using rule-based patterns
+        extraction_results = extract_terms_from_text(
+            pages_dict,
+            source=SourceType.APPROVED.value
+        )
+        
+        # Convert to legacy format with normalization
+        terms = [
+            _convert_extraction_result(result, apply_normalization=True)
+            for result in extraction_results
+        ]
+        
+        logger.info(f"Extracted {len(terms)} approved terms from {filename}")
+        return terms
+        
+    except Exception as e:
+        logger.error(f"Failed to extract approved terms from {filename}: {e}")
+        raise
 
 
-def extract_executed_terms(file_obj, filename: str) -> List[ExtractedTermData]:
+def extract_executed_terms(file_obj: BinaryIO, filename: str) -> List[ExtractedTermData]:
     """
-    Extract terms from the Executed Agreement (Boeing Credit Agreement).
-    Uses regex-based parsing to find actual values from the agreement.
-    """
-    terms = []
+    Extract terms from the Executed Agreement.
     
-    # Try to extract text from PDF
+    REGULATORY REQUIREMENT:
+    - All terms must have evidence from the document
+    - No hallucination allowed
+    
+    Args:
+        file_obj: File-like object containing the PDF
+        filename: Original filename (for logging)
+        
+    Returns:
+        List of extracted terms with evidence
+    """
+    logger.info(f"Extracting executed terms from: {filename}")
+    
     try:
-        text = extract_text_from_pdf(file_obj)
-    except Exception:
-        text = ""
-    
-    # For Boeing Credit Agreement - extract actual terms
-    # These represent what was actually executed (may differ from approved)
-    
-    # Extract Borrower
-    borrower_match = re.search(r'THE BOEING COMPANY|Boeing Company', text, re.IGNORECASE)
-    terms.append(ExtractedTermData(
-        key='borrower',
-        label='Borrower',
-        value='The Boeing Company',
-        source='EXECUTED',
-        confidence=0.98,
-        evidence_text='THE BOEING COMPANY, a Delaware corporation (the "Borrower")',
-        evidence_location='Page 1, Preamble'
-    ))
-    
-    # Extract Facility Type - 364-Day Revolving
-    terms.append(ExtractedTermData(
-        key='facility_type',
-        label='Facility Type',
-        value='364-Day Revolving Credit Facility',
-        source='EXECUTED',
-        confidence=0.95,
-        evidence_text='364-DAY CREDIT AGREEMENT... revolving credit facility',
-        evidence_location='Page 1, Title and Section 2.01'
-    ))
-    
-    # Extract Facility Amount - This is where the MISMATCH occurs
-    # The executed agreement has a DIFFERENT amount than approved
-    facility_amount_match = re.search(r'\$\s*([\d,]+(?:\.\d+)?)\s*(?:million|,000,000)', text, re.IGNORECASE)
-    terms.append(ExtractedTermData(
-        key='facility_amount',
-        label='Facility Amount',
-        value='USD 6,000,000,000',  # Actual Boeing 2025 credit agreement amount
-        source='EXECUTED',
-        confidence=0.95,
-        evidence_text='"Aggregate Commitments" means the aggregate of the Commitments of all Lenders, which aggregate Commitments shall initially equal $6,000,000,000',
-        evidence_location='Page 5, Section 1.01 Definitions - "Aggregate Commitments"'
-    ))
-    
-    # Extract Currency
-    terms.append(ExtractedTermData(
-        key='currency',
-        label='Currency',
-        value='USD',
-        source='EXECUTED',
-        confidence=0.98,
-        evidence_text='Dollars or $ refers to lawful money of the United States of America',
-        evidence_location='Page 8, Section 1.01 Definitions'
-    ))
-    
-    # Extract Maturity/Termination Date - MISMATCH from approved
-    terms.append(ExtractedTermData(
-        key='maturity_date',
-        label='Maturity Date',
-        value='2026-08-24',  # One day earlier than approved
-        source='EXECUTED',
-        confidence=0.92,
-        evidence_text='"Maturity Date" means August 24, 2026',
-        evidence_location='Page 12, Section 1.01 Definitions - "Maturity Date"'
-    ))
-    
-    # Extract Benchmark Rate
-    terms.append(ExtractedTermData(
-        key='benchmark',
-        label='Interest Rate Benchmark',
-        value='SOFR',
-        source='EXECUTED',
-        confidence=0.98,
-        evidence_text='"Term SOFR" means, for any Interest Period, the Term SOFR Reference Rate for a tenor comparable to such Interest Period',
-        evidence_location='Page 18, Section 1.01 Definitions - "Term SOFR"'
-    ))
-    
-    # Extract Margin - DEVIATION from approved (grid-based, not fixed)
-    terms.append(ExtractedTermData(
-        key='margin_bps',
-        label='Applicable Margin',
-        value='100-150 bps (Rating Grid)',  # Different from flat 125 bps approved
-        source='EXECUTED',
-        confidence=0.88,
-        evidence_text='Applicable Rate means, for any day, with respect to any Term Benchmark Loan, the applicable rate per annum set forth in the table below based on the Debt Ratings: Level I (A+/A1): 1.000%, Level II (A/A2): 1.125%, Level III (A-/A3): 1.250%',
-        evidence_location='Page 5, Section 1.01 Definitions - "Applicable Rate"'
-    ))
-    
-    # Extract Leverage Covenant
-    terms.append(ExtractedTermData(
-        key='covenant_total_net_leverage',
-        label='Total Net Leverage Covenant',
-        value='3.50x',
-        source='EXECUTED',
-        confidence=0.90,
-        evidence_text='Total Leverage Ratio. The Borrower will not permit the Total Leverage Ratio... to exceed 3.50 to 1.00',
-        evidence_location='Page 48, Section 6.08 - Financial Covenant'
-    ))
-    
-    # Covenant frequency - Missing explicit quarterly reference
-    terms.append(ExtractedTermData(
-        key='covenant_frequency',
-        label='Covenant Testing Frequency',
-        value='Not Explicitly Stated',
-        source='EXECUTED',
-        confidence=0.75,
-        evidence_text='The Borrower will deliver... financial statements... (implied periodic testing)',
-        evidence_location='Page 42, Section 5.01 - Financial Statements'
-    ))
-    
-    # Sanctions Clause - Present
-    terms.append(ExtractedTermData(
-        key='sanctions_clause_present',
-        label='Sanctions Clause Present',
-        value='Yes',
-        source='EXECUTED',
-        confidence=0.95,
-        evidence_text='"Sanctions" means any sanctions administered or enforced by OFAC, the U.S. Department of State, the United Nations Security Council, the European Union...',
-        evidence_location='Page 16, Section 1.01 Definitions - "Sanctions"'
-    ))
-    
-    # Bail-In Clause - Present
-    terms.append(ExtractedTermData(
-        key='bail_in_clause_present',
-        label='Bail-In Clause Present',
-        value='Yes',
-        source='EXECUTED',
-        confidence=0.95,
-        evidence_text='ARTICLE X ACKNOWLEDGEMENT AND CONSENT TO BAIL-IN OF AFFECTED FINANCIAL INSTITUTIONS',
-        evidence_location='Page 82, Article X'
-    ))
-    
-    return terms
+        # Extract text with page tracking
+        pages = extract_text_with_pages(file_obj)
+        pages_dict = _convert_pages_to_dict(pages)
+        
+        # Check if we got any text
+        total_text = sum(len(p.text) for p in pages)
+        if total_text < 100:
+            logger.warning(f"Very little text extracted from {filename} ({total_text} chars)")
+        
+        # Extract terms using rule-based patterns
+        extraction_results = extract_terms_from_text(
+            pages_dict,
+            source=SourceType.EXECUTED.value
+        )
+        
+        # Convert to legacy format with normalization
+        terms = [
+            _convert_extraction_result(result, apply_normalization=True)
+            for result in extraction_results
+        ]
+        
+        logger.info(f"Extracted {len(terms)} executed terms from {filename}")
+        return terms
+        
+    except Exception as e:
+        logger.error(f"Failed to extract executed terms from {filename}: {e}")
+        raise
 
 
-def validate_terms(approved_terms: List[ExtractedTermData], 
-                   executed_terms: List[ExtractedTermData]) -> List[Dict[str, Any]]:
+def validate_terms_comparison(
+    approved_terms: List[ExtractedTermData],
+    executed_terms: List[ExtractedTermData]
+) -> List[Dict[str, Any]]:
     """
     Compare approved terms against executed terms and generate issues.
+    
+    REGULATORY REQUIREMENT:
+    - Every issue must have evidence from both documents
+    - Severity must be justified based on regulatory impact
+    
+    Args:
+        approved_terms: Terms from approved credit summary
+        executed_terms: Terms from executed agreement
+        
+    Returns:
+        List of issue dictionaries
     """
-    issues = []
+    logger.info(f"Validating {len(approved_terms)} approved vs {len(executed_terms)} executed terms")
     
-    # Build lookup dictionaries
-    approved_lookup = {t.key: t for t in approved_terms}
-    executed_lookup = {t.key: t for t in executed_terms}
+    # Run validation
+    issues = validate_terms(approved_terms, executed_terms)
     
-    # 1) FACILITY AMOUNT MISMATCH
-    if 'facility_amount' in approved_lookup and 'facility_amount' in executed_lookup:
-        approved_val = approved_lookup['facility_amount'].value
-        executed_val = executed_lookup['facility_amount'].value
+    # Also check internal consistency
+    approved_consistency = check_internal_consistency(approved_terms, 'APPROVED')
+    executed_consistency = check_internal_consistency(executed_terms, 'EXECUTED')
+    
+    all_issues = issues + approved_consistency + executed_consistency
+    
+    # Convert to dictionaries
+    issue_dicts = [issue.to_dict() for issue in all_issues]
+    
+    logger.info(f"Found {len(issue_dicts)} issues during validation")
+    return issue_dicts
+
+
+# Alias for backward compatibility with views.py
+def validate_terms_legacy(
+    approved_terms: List[ExtractedTermData],
+    executed_terms: List[ExtractedTermData]
+) -> List[Dict[str, Any]]:
+    """Backward-compatible alias for validate_terms_comparison."""
+    return validate_terms_comparison(approved_terms, executed_terms)
+
+
+def extract_borrower_info(file_obj: BinaryIO) -> Dict[str, str]:
+    """
+    Extract borrower/facility info from a document.
+    
+    Returns:
+        Dict with 'borrower_name' and 'facility_name' keys
+    """
+    try:
+        pages = extract_text_with_pages(file_obj)
+        pages_dict = _convert_pages_to_dict(pages)
         
-        if approved_val != executed_val:
-            issues.append({
-                'severity': 'HIGH',
-                'code': 'MISMATCH',
-                'message': 'Facility Amount differs between Approved Credit Summary and Executed Agreement',
-                'related_term_key': 'facility_amount',
-                'related_term_label': 'Facility Amount',
-                'evidence': f'Approved: {approved_val} vs Executed: {executed_val}',
-                'approved_evidence': approved_lookup['facility_amount'].evidence_text,
-                'executed_evidence': executed_lookup['facility_amount'].evidence_text,
-                'regulation_impact': 'Material economic divergence exceeds approved credit limit. Requires immediate credit committee escalation and re-approval before drawdown.'
-            })
-    
-    # 2) MATURITY DATE MISMATCH
-    if 'maturity_date' in approved_lookup and 'maturity_date' in executed_lookup:
-        approved_val = approved_lookup['maturity_date'].value
-        executed_val = executed_lookup['maturity_date'].value
+        results = extract_terms_from_text(pages_dict, 'INFO')
         
-        if approved_val != executed_val:
-            issues.append({
-                'severity': 'HIGH',
-                'code': 'MISMATCH',
-                'message': 'Maturity Date differs between Approved Credit Summary and Executed Agreement',
-                'related_term_key': 'maturity_date',
-                'related_term_label': 'Maturity Date',
-                'evidence': f'Approved: {approved_val} vs Executed: {executed_val}',
-                'approved_evidence': approved_lookup['maturity_date'].evidence_text,
-                'executed_evidence': executed_lookup['maturity_date'].evidence_text,
-                'regulation_impact': 'Tenor mismatch affects facility classification and liquidity reporting. Verify whether deviation was authorized.'
-            })
-    
-    # 3) MARGIN DEVIATION
-    if 'margin_bps' in approved_lookup and 'margin_bps' in executed_lookup:
-        approved_val = approved_lookup['margin_bps'].value
-        executed_val = executed_lookup['margin_bps'].value
+        info = {
+            'borrower_name': '',
+            'facility_name': '',
+        }
         
-        if '125' not in executed_val or 'Grid' in executed_val:
-            issues.append({
-                'severity': 'WARN',
-                'code': 'MISMATCH',
-                'message': 'Applicable Margin structure differs from approved fixed rate',
-                'related_term_key': 'margin_bps',
-                'related_term_label': 'Applicable Margin',
-                'evidence': f'Approved: {approved_val} (fixed) vs Executed: {executed_val} (variable grid)',
-                'approved_evidence': approved_lookup['margin_bps'].evidence_text,
-                'executed_evidence': executed_lookup['margin_bps'].evidence_text,
-                'regulation_impact': 'Pricing structure uses rating-based grid instead of fixed margin. May result in different interest expense under rating changes.'
-            })
+        for result in results:
+            if result.key == 'borrower' and not info['borrower_name']:
+                info['borrower_name'] = result.value
+            elif result.key == 'facility_type' and not info['facility_name']:
+                info['facility_name'] = result.value
+        
+        return info
+        
+    except Exception as e:
+        logger.warning(f"Could not extract borrower info: {e}")
+        return {'borrower_name': '', 'facility_name': ''}
+
+
+def get_document_summary(file_obj: BinaryIO, filename: str) -> Dict[str, Any]:
+    """
+    Get a summary of a document including page count and detected terms.
     
-    # 4) BAIL-IN CLAUSE PRESENCE
-    if 'bail_in_clause_present' in executed_lookup:
-        if executed_lookup['bail_in_clause_present'].value == 'Yes':
-            issues.append({
-                'severity': 'INFO',
-                'code': 'CLAUSE_PRESENT',
-                'message': 'EU/EEA Bail-In recognition clause is present in executed agreement',
-                'related_term_key': 'bail_in_clause_present',
-                'related_term_label': 'Bail-In Clause',
-                'evidence': 'Bail-In acknowledgement clause found in Article X',
-                'approved_evidence': approved_lookup.get('bail_in_clause_required', ExtractedTermData('','','','',0,'','')).evidence_text,
-                'executed_evidence': executed_lookup['bail_in_clause_present'].evidence_text,
-                'regulation_impact': 'Compliant with Article 55 BRRD requirements for contracts governed by non-EU law.'
-            })
-    
-    # 5) SANCTIONS CLAUSE PRESENCE
-    if 'sanctions_clause_present' in executed_lookup:
-        if executed_lookup['sanctions_clause_present'].value == 'Yes':
-            issues.append({
-                'severity': 'INFO',
-                'code': 'CLAUSE_PRESENT',
-                'message': 'Sanctions compliance clause is present in executed agreement',
-                'related_term_key': 'sanctions_clause_present',
-                'related_term_label': 'Sanctions Clause',
-                'evidence': 'Comprehensive Sanctions definitions and representations found',
-                'approved_evidence': approved_lookup.get('sanctions_clause_required', ExtractedTermData('','','','',0,'','')).evidence_text,
-                'executed_evidence': executed_lookup['sanctions_clause_present'].evidence_text,
-                'regulation_impact': 'Compliant with OFAC, EU, and UN sanctions screening requirements.'
-            })
-    
-    # 6) COMPLETENESS CHECK - Covenant frequency
-    if 'covenant_total_net_leverage' in executed_lookup and 'covenant_frequency' in executed_lookup:
-        freq_val = executed_lookup['covenant_frequency'].value
-        if 'Not' in freq_val or freq_val.lower() == 'missing':
-            issues.append({
-                'severity': 'WARN',
-                'code': 'COMPLETENESS',
-                'message': 'Covenant testing frequency is not explicitly stated in executed agreement',
-                'related_term_key': 'covenant_frequency',
-                'related_term_label': 'Covenant Testing Frequency',
-                'evidence': 'Approved: Quarterly testing vs Executed: Testing frequency not explicitly defined',
-                'approved_evidence': approved_lookup.get('covenant_frequency', ExtractedTermData('','','','',0,'','')).evidence_text,
-                'executed_evidence': executed_lookup['covenant_frequency'].evidence_text,
-                'regulation_impact': 'Ambiguous testing frequency may lead to disputes. Recommend clarification or side letter.'
-            })
-    
-    return issues
+    Args:
+        file_obj: File-like object
+        filename: Original filename
+        
+    Returns:
+        Summary dictionary
+    """
+    try:
+        file_hash = compute_sha256(file_obj)
+        pages = extract_text_with_pages(file_obj)
+        
+        total_chars = sum(len(p.text) for p in pages)
+        pages_with_text = sum(1 for p in pages if p.has_content)
+        
+        return {
+            'filename': filename,
+            'hash': file_hash,
+            'page_count': len(pages),
+            'pages_with_text': pages_with_text,
+            'total_characters': total_chars,
+            'extraction_methods': list(set(p.extraction_method for p in pages)),
+        }
+        
+    except Exception as e:
+        logger.error(f"Failed to get document summary: {e}")
+        return {
+            'filename': filename,
+            'error': str(e),
+        }
