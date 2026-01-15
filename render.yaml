@@ -1,0 +1,24 @@
+databases:
+  - name: docconform-db
+    databaseName: docconform
+    user: docconform
+    plan: free
+
+services:
+  - type: web
+    name: docconform-api
+    runtime: python
+    plan: free
+    buildCommand: ./build.sh
+    startCommand: gunicorn docconform_backend.wsgi:application
+    envVars:
+      - key: DATABASE_URL
+        fromDatabase:
+          name: docconform-db
+          property: connectionString
+      - key: SECRET_KEY
+        generateValue: true
+      - key: DEBUG
+        value: "false"
+      - key: FRONTEND_URL
+        sync: false
